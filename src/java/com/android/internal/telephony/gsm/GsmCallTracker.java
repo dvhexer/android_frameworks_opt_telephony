@@ -63,6 +63,15 @@ public final class GsmCallTracker extends CallTracker {
     static final int MAX_CONNECTIONS = 7;   // only 7 connections allowed in GSM
     static final int MAX_CONNECTIONS_PER_CALL = 5; // only 5 connections allowed per call
 
+    // this property defines whether to keep polling for pending call status if
+    // it's not yet available after initiating a call: this happens on "slow" modems, like LG E970 JB modem
+    static final String PENDING_CALL_STATUS_POLL_PROP = "ro.telephony.call_stat_poll";
+    // if polling for pending call status is enabled, this defines the default timeout
+    // after which the call will be hung up if the status is still not received
+    static final long DEFAULT_PENDING_CALL_STATUS_TIMEOUT = 20000; //20 seconds
+    // property to override pending call status poll timeout
+    static final String PENDING_CALL_STATUS_TIMEOUT_PROP = "ro.telephony.call_stat_timeout";
+
     //***** Instance Variables
     GsmConnection connections[] = new GsmConnection[MAX_CONNECTIONS];
     RegistrantList voiceCallEndedRegistrants = new RegistrantList();
@@ -80,6 +89,10 @@ public final class GsmCallTracker extends CallTracker {
 
     GsmConnection pendingMO;
     boolean hangupPendingMO;
+
+    boolean pendingCallStatusPoll;
+    long pendingCallStatusPollTimeout;
+    long pendingCallInitTS;
 
     GSMPhone phone;
 
@@ -102,6 +115,27 @@ public final class GsmCallTracker extends CallTracker {
 
         cm.registerForOn(this, EVENT_RADIO_AVAILABLE, null);
         cm.registerForNotAvailable(this, EVENT_RADIO_NOT_AVAILABLE, null);
+
+        // normally, DriverCall for pendingMO is available on the first poll,
+        // so no need for additional polling:
+        // set pendingCallStatusPoll to false by default
+        String pendingCallStatusPollStr = SystemProperties.get(PENDING_CALL_STATUS_POLL_PROP, "false");
+        pendingCallStatusPoll = Boolean.parseBoolean(pendingCallStatusPollStr);
+        Log.i(LOG_TAG, "Pending Call Status Poll = " + pendingCallStatusPoll);
+
+        if(pendingCallStatusPoll) {
+            String pendingCallStatusPollTimeoutStr = SystemProperties.get(PENDING_CALL_STATUS_TIMEOUT_PROP,
+                    Long.toString(DEFAULT_PENDING_CALL_STATUS_TIMEOUT));
+            try {
+                pendingCallStatusPollTimeout = Long.parseLong(pendingCallStatusPollTimeoutStr);
+            } catch (NumberFormatException e) {
+                Log.e(LOG_TAG, "Invalid " + PENDING_CALL_STATUS_TIMEOUT_PROP+ " value: " +
+                      pendingCallStatusPollTimeoutStr + ". Using default: " +
+                      DEFAULT_PENDING_CALL_STATUS_TIMEOUT);
+                pendingCallStatusPollTimeout = DEFAULT_PENDING_CALL_STATUS_TIMEOUT;
+            }
+            Log.i(LOG_TAG, "Pending Call Status Poll Timeout = " + pendingCallStatusPollTimeout);
+        }
     }
 
     public void dispose() {
@@ -204,6 +238,7 @@ public final class GsmCallTracker extends CallTracker {
         pendingMO = new GsmConnection(phone.getContext(), checkForTestEmergencyNumber(dialString),
                 this, foregroundCall);
         hangupPendingMO = false;
+        pendingCallInitTS = System.currentTimeMillis();
 
         if (pendingMO.address == null || pendingMO.address.length() == 0
             || pendingMO.address.indexOf(PhoneNumberUtils.WILD) >= 0
@@ -415,14 +450,17 @@ public final class GsmCallTracker extends CallTracker {
 
         if (ar.exception == null) {
             polledCalls = (List)ar.result;
+            if (DBG_POLL) log("poll: ar.exception == null");
         } else if (isCommandExceptionRadioNotAvailable(ar.exception)) {
             // just a dummy empty ArrayList to cause the loop
             // to hang up all the calls
             polledCalls = new ArrayList();
+            if (DBG_POLL) log("poll: isCommandExceptionRadioNotAvailable(ar.exception) == true");
         } else {
             // Radio probably wasn't ready--try again in a bit
             // But don't keep polling if the channel is closed
             pollCallsAfterDelay();
+            if (DBG_POLL) log("poll: call pollCallsAfterDelay()");
             return;
         }
 
@@ -552,6 +590,28 @@ public final class GsmCallTracker extends CallTracker {
         // We expect the pending call to appear in the list
         // If it does not, we land here
         if (pendingMO != null) {
+            if (pendingCallStatusPoll) {
+                // DriverCall matching pendingMo are is not available right after calling
+                // in the case of "slow" modems (like LG E970 ATT 4.1.2 modem)
+                // try to poll status again but hang up when timeout is reached
+                long currentTS = System.currentTimeMillis();
+                if(currentTS - pendingCallInitTS > pendingCallStatusPollTimeout) {
+                    if (DBG_POLL) {
+                        log("poll: no DriverCall matching pending MO found in call status poll result." +
+                            " Dropping pendingMO since call status poll timeout of " +
+                            pendingCallStatusPollTimeout + "ms has been reached");
+                    }
+                } else {
+                    if (DBG_POLL) {
+                        log("poll: no DriverCall matching pending MO found in call status poll result." +
+                            " Timeout of " + pendingCallStatusPollTimeout + "ms has not been reached yet. " +
+                            "Calling pollCallsAfterDelay()");
+                    }
+                    pollCallsAfterDelay();
+                    return;
+                }
+            }
+
             Log.d(LOG_TAG,"Pending MO dropped before poll fg state:"
                             + foregroundCall.getState());
 
@@ -945,6 +1005,9 @@ public final class GsmCallTracker extends CallTracker {
         pw.println(" backgroundCall=" + backgroundCall);
         pw.println(" pendingMO=" + pendingMO);
         pw.println(" hangupPendingMO=" + hangupPendingMO);
+        if(pendingCallStatusPoll) {
+            pw.println(" pendingCallInitTS=" + pendingCallInitTS);
+        }
         pw.println(" phone=" + phone);
         pw.println(" desiredMute=" + desiredMute);
         pw.println(" state=" + state);
