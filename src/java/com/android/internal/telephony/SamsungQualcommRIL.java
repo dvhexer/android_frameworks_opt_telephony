@@ -62,6 +62,8 @@ public class SamsungQualcommRIL extends RIL implements CommandsInterface {
     public static final long SEND_SMS_TIMEOUT_IN_MS = 30000;
     private String homeOperator= SystemProperties.get("ro.cdma.home.operator.numeric");
     private String operator= SystemProperties.get("ro.cdma.home.operator.alpha");
+    private boolean oldRilState = needsOldRilFeature("exynos4RadioState");
+    private boolean googleEditionSS = needsOldRilFeature("googleEditionSS");
     public SamsungQualcommRIL(Context context, int networkMode,
             int cdmaSubscription) {
         super(context, networkMode, cdmaSubscription);
@@ -168,7 +170,9 @@ public class SamsungQualcommRIL extends RIL implements CommandsInterface {
         response[4] %= 256;
 
         // RIL_LTE_SignalStrength
-        if (response[7] == 99) {
+        if (googleEditionSS && !isGSM){
+            response[8] = response[2];
+        }else if (response[7] == 99) {
             // If LTE is not enabled, clear LTE results
             // 7-11 must be -1 for GSM signal strength to be used (see
             // frameworks/base/telephony/java/android/telephony/SignalStrength.java)
@@ -179,9 +183,42 @@ public class SamsungQualcommRIL extends RIL implements CommandsInterface {
         }else{ // lte is gsm on samsung/qualcomm cdma stack
             response[7] &= 0xff;
         }
-
         return new SignalStrength(response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7], response[8], response[9], response[10], response[11], isGSM);
 
+    }
+
+    @Override
+    protected RadioState getRadioStateFromInt(int stateInt) {
+        if(!oldRilState)
+            super.getRadioStateFromInt(stateInt);
+        RadioState state;
+
+        /* RIL_RadioState ril.h */
+        switch(stateInt) {
+            case 0: state = RadioState.RADIO_OFF; break;
+            case 1:
+            case 2: state = RadioState.RADIO_UNAVAILABLE; break;
+            case 4:
+                // When SIM is PIN-unlocked, RIL doesn't respond with RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED.
+                // We notify the system here.
+                Log.d(LOG_TAG, "SIM is PIN-unlocked now");
+                if (mIccStatusChangedRegistrants != null) {
+                    mIccStatusChangedRegistrants.notifyRegistrants();
+                }
+            case 3:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+            case 9:
+            case 10:
+            case 13: state = RadioState.RADIO_ON; break;
+
+            default:
+                throw new RuntimeException(
+                                           "Unrecognized RIL_RadioState: " + stateInt);
+        }
+        return state;
     }
 
     @Override
